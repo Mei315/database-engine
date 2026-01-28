@@ -4,10 +4,17 @@
 #include <memory>
 #include <unordered_map>
 #include <cstring>
+#include <fstream>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 
 // ============ 页式存储配置 ============
 const int PAGE_SIZE = 4096;  // 4KB页大小
-const int MAX_KEYS_PER_PAGE = 50;  // 每页最大键数
+const int MAX_KEYS_PER_PAGE = 100;  // 每页最大键数
 
 using PageID = uint32_t;
 const PageID INVALID_PAGE_ID = 0;
@@ -83,9 +90,58 @@ public:
         return pageTable[pageId];
     }
     
-    // 刷新页面到磁盘（模拟）
+    // 刷新页面到磁盘（将页面序列化为可读文本文件，便于验证）
     void flushPage(PageID pageId) {
+        Page<KeyType, ValueType>* page = fetchPage(pageId);
         std::cout << "[DISK I/O] 刷新页面 " << pageId << " 到磁盘\n";
+
+    try {
+#ifdef _WIN32
+        _mkdir("page_files");
+#else
+        mkdir("page_files", 0755);
+#endif
+            std::string filePath = std::string("page_files/page_") + std::to_string(pageId) + ".txt";
+            std::ofstream ofs(filePath);
+            if (!ofs.is_open()) {
+                std::cerr << "[ERROR] 无法打开文件写入: " << filePath << "\n";
+                return;
+            }
+
+            ofs << "PageID: " << pageId << "\n";
+            ofs << "PageType: " << (int)page->header.pageType << "\n";
+            ofs << "KeyCount: " << page->header.keyCount << "\n";
+            ofs << "ParentPageId: " << page->header.parentPageId << "\n";
+            ofs << "NextPageId: " << page->header.nextPageId << "\n";
+            ofs << "PrevPageId: " << page->header.prevPageId << "\n";
+
+            ofs << "Keys:\n";
+            for (uint32_t i = 0; i < page->header.keyCount; i++) {
+                ofs << page->keys[i];
+                if (i + 1 < page->header.keyCount) ofs << '\t';
+            }
+            ofs << "\n";
+
+            if (page->header.pageType == INTERNAL_PAGE) {
+                ofs << "Children:\n";
+                for (uint32_t i = 0; i <= page->header.keyCount; i++) {
+                    ofs << page->children[i];
+                    if (i < page->header.keyCount) ofs << '\t';
+                }
+                ofs << "\n";
+            } else {
+                ofs << "Values:\n";
+                for (uint32_t i = 0; i < page->header.keyCount; i++) {
+                    ofs << page->values[i];
+                    if (i + 1 < page->header.keyCount) ofs << '\t';
+                }
+                ofs << "\n";
+            }
+
+            ofs.close();
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] flushPage 异常: " << e.what() << "\n";
+        }
     }
     
     // 删除页面
@@ -456,7 +512,7 @@ int main() {
     // 测试4: 大量插入测试
     std::cout << "\n===== 测试4: 大量插入 =====\n";
     PagedBPlusTree<int, int> largeTree(5);
-    for (int i = 1; i <= 20; i++) {
+    for (int i = 1; i <= 200; i++) {
         largeTree.insert(i, i * 100);
     }
     std::cout << "插入20个元素后:\n";
