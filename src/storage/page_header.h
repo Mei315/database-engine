@@ -17,20 +17,21 @@ enum PageType : uint8_t {
 
 #pragma pack(push, 1)  // 强制字节对齐为1，禁止编译器插入Padding（跨编译器一致）
 struct PageHeader {
-    uint32_t magic;     // 0-3 标识格式
-    uint16_t version;   // 4-5 版本
-    uint64_t lsn;       // 6-13 日志序列号：用于崩溃恢复
-    uint32_t page_id;   // 14-17 当前页ID
-    uint16_t upper_ptr; // 18-19 数据区起始偏移（向上增长）
-    uint16_t lower_ptr; // 20-21 槽目录起始偏移（向下增长）
-    uint8_t  is_leaf;   // 22 是否为叶子节点（0/1）
-    uint16_t key_count; // 23-24 当前键数量
-    uint32_t checksum;  // 25-28 校验
+    uint32_t checksum;  // 0-3 校验
+    uint32_t magic;     // 4-7 标识格式
+    uint16_t version;   // 8-9 版本号
+    uint16_t page_type; // 10-11 页类型 (内部节点/叶子节点/溢出页)
+    uint64_t lsn;       // 12-19 日志序列号：用于崩溃恢复
+    uint32_t page_id;   // 20-23 当前页ID
+    uint16_t upper_ptr; // 24-25 数据区起始偏移（向上增长）
+    uint16_t lower_ptr; // 26-27 槽目录起始偏移（向下增长）
+    uint16_t key_count; // 28-29 当前记录(槽)数量
+    uint16_t dir_count; // 30-31 Page Directory 数量 (用于加速查找)
 };
 #pragma pack(pop)
 
 
-static_assert(sizeof(PageHeader) == 29, "PageHeader size mismatch！！！");
+static_assert(sizeof(PageHeader) == 32, "PageHeader size mismatch！！！");
 
 // 强制使用小端序读
 static inline uint16_t read_u16_le(const uint8_t *p) {
@@ -61,28 +62,30 @@ static inline void write_u64_le(uint8_t *p, uint64_t v) {
 
 // 序列化：将内存中的页头字段按固定顺序写入到一个字节缓冲
 static inline void serialize_header(const PageHeader &h, uint8_t *buf) {
-    write_u32_le(buf + 0, h.magic);
-    write_u16_le(buf + 4, h.version);
-    write_u64_le(buf + 6, h.lsn);
-    write_u32_le(buf + 14, h.page_id);
-    write_u16_le(buf + 18, h.upper_ptr);
-    write_u16_le(buf + 20, h.lower_ptr);
-    buf[22] = h.is_leaf;
-    write_u16_le(buf + 23, h.key_count);
-    write_u32_le(buf + 25, h.checksum);
+    write_u32_le(buf + 0,  h.checksum);
+    write_u32_le(buf + 4,  h.magic);
+    write_u16_le(buf + 8,  h.version);
+    write_u16_le(buf + 10, h.page_type);
+    write_u64_le(buf + 12, h.lsn);
+    write_u32_le(buf + 20, h.page_id);
+    write_u16_le(buf + 24, h.upper_ptr);
+    write_u16_le(buf + 26, h.lower_ptr);
+    write_u16_le(buf + 28, h.key_count);
+    write_u16_le(buf + 30, h.dir_count);
 }
 
 // 反序列化
 static inline void deserialize_header(const uint8_t *buf, PageHeader &h) {
-    h.magic = read_u32_le(buf + 0);
-    h.version = read_u16_le(buf + 4);
-    h.lsn = read_u64_le(buf + 6);
-    h.page_id = read_u32_le(buf + 14);
-    h.upper_ptr = read_u16_le(buf + 18);
-    h.lower_ptr = read_u16_le(buf + 20);
-    h.is_leaf = buf[22];
-    h.key_count = read_u16_le(buf + 23);
-    h.checksum = read_u32_le(buf + 25);
+    h.checksum  = read_u32_le(buf + 0);
+    h.magic     = read_u32_le(buf + 4);
+    h.version   = read_u16_le(buf + 8);
+    h.page_type = read_u16_le(buf + 10);
+    h.lsn       = read_u64_le(buf + 12);
+    h.page_id   = read_u32_le(buf + 20);
+    h.upper_ptr = read_u16_le(buf + 24);
+    h.lower_ptr = read_u16_le(buf + 26);
+    h.key_count = read_u16_le(buf + 28);
+    h.dir_count = read_u16_le(buf + 30);
 }
 
 // 检测数据是否损坏
@@ -97,9 +100,19 @@ static inline uint32_t simple_checksum(const uint8_t *data, size_t len) {
     return sum;
 }
 
-static inline void finalize_header_checksum(uint8_t *buf) {
-    // 假定 checksum 位于偏移 25，长度为 4
-    // 计算整个 buf 除去 checksum 字段之外的 checksum
-    uint32_t cs = simple_checksum(buf, 25);
-    write_u32_le(buf + 25, cs);
+// 计算并写入整个页面的 checksum
+static inline void finalize_page_checksum(uint8_t *page_buf) {
+    // 跳过前 4 字节（checksum 字段本身），计算后面所有内容的 hash
+    // PAGE_SIZE 是 4096
+    uint32_t cs = simple_checksum(page_buf + 4, PAGE_SIZE - 4);
+    
+    // 将结果写回前 4 字节
+    write_u32_le(page_buf + 0, cs);
+}
+
+// 读取并验证 checksum
+static inline bool verify_page_checksum(const uint8_t *page_buf) {
+    uint32_t stored_cs = read_u32_le(page_buf + 0);
+    uint32_t computed_cs = simple_checksum(page_buf + 4, PAGE_SIZE - 4);
+    return stored_cs == computed_cs;
 }
