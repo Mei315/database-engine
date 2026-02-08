@@ -26,12 +26,11 @@ struct PageHeader {
     uint16_t upper_ptr; // 24-25 数据区起始偏移（向上增长）
     uint16_t lower_ptr; // 26-27 槽目录起始偏移（向下增长）
     uint16_t key_count; // 28-29 当前记录(槽)数量
-    uint16_t dir_count; // 30-31 Page Directory 数量 (用于加速查找)
 };
 #pragma pack(pop)
 
 
-static_assert(sizeof(PageHeader) == 32, "PageHeader size mismatch！！！");
+static_assert(sizeof(PageHeader) == 30, "PageHeader size mismatch！！！");
 
 // 强制使用小端序读
 static inline uint16_t read_u16_le(const uint8_t *p) {
@@ -71,7 +70,6 @@ static inline void serialize_header(const PageHeader &h, uint8_t *buf) {
     write_u16_le(buf + 24, h.upper_ptr);
     write_u16_le(buf + 26, h.lower_ptr);
     write_u16_le(buf + 28, h.key_count);
-    write_u16_le(buf + 30, h.dir_count);
 }
 
 // 反序列化
@@ -85,7 +83,6 @@ static inline void deserialize_header(const uint8_t *buf, PageHeader &h) {
     h.upper_ptr = read_u16_le(buf + 24);
     h.lower_ptr = read_u16_le(buf + 26);
     h.key_count = read_u16_le(buf + 28);
-    h.dir_count = read_u16_le(buf + 30);
 }
 
 // 检测数据是否损坏
