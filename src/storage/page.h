@@ -37,8 +37,8 @@ Byte Offset     Component              Description
 // 槽目录
 #pragma pack(push, 1)
 struct SlotEntry {
-    uint32_t offset;  // 每个tuple对应的offset值
-    uint32_t length;  // 每个tuple的长度
+    uint32_t offset;  // Tuple 的起始位置
+    uint32_t length;  // Tuple 的长度
 };
 #pragma pack(pop)
 
@@ -58,10 +58,50 @@ struct LeafNode {
 
 class Page {
 private:
-    uint8_t data_[PAGE_SIZE];  // 4KB 原始数据
+    uint8_t data_[PAGE_SIZE];  // 4KB
     PageHeader header_;        
     bool dirty_;               // 脏页标记
     bool is_pinned_;           // 当前是否有线程正在使用这个页
+
+    // 获取槽数组起始偏移量
+    uint16_t get_slot_array_offset() const {
+        return static_cast<uint16_t>(sizeof(PageHeader));
+    }
+
+    // 获取特定槽位的 Key (用于二分查找)
+    int get_key_at_slot(uint16_t slot_idx) const {
+        const SlotEntry* slot = get_slot_ptr(slot_idx);
+        if (header_.page_type == LEAF_PAGE) {
+            return reinterpret_cast<const LeafNode*>(data_ + slot->offset)->key;
+        } else {
+            return reinterpret_cast<const InternalNode*>(data_ + slot->offset)->key;
+        }
+    }
+
+    // 获取槽位指针（原始位置）
+    SlotEntry* get_slot_ptr(uint16_t slot_idx) {
+        return reinterpret_cast<SlotEntry*>(data_ + get_slot_array_offset() + (slot_idx * sizeof(SlotEntry)));
+    }
+
+    const SlotEntry* get_slot_ptr(uint16_t slot_idx) const {
+        return reinterpret_cast<const SlotEntry*>(data_ + get_slot_array_offset() + (slot_idx * sizeof(SlotEntry)));
+    }
+
+    // 写入槽位信息
+    void write_slot_to_buffer(uint16_t slot_idx, const SlotEntry& se) {
+        std::memcpy(get_slot_ptr(slot_idx), &se, sizeof(SlotEntry));
+    }
+
+    // 寻找插入点：返回第一个 key >= target_key 的槽位索引 (二分查找)
+    uint16_t find_insertion_point(int target_key) const {
+        int left = 0, right = header_.key_count - 1;
+        while (left <= right) {
+            int mid = left + (right - left) / 2;
+            if (get_key_at_slot(mid) < target_key) left = mid + 1;
+            else right = mid - 1;
+        }
+        return static_cast<uint16_t>(left);
+    }
 
 public:
     Page() : dirty_(false), is_pinned_(false) {
@@ -78,11 +118,9 @@ public:
     header_.page_id = page_id;
     header_.upper_ptr = static_cast<uint16_t>(PAGE_SIZE); 
     header_.lower_ptr = static_cast<uint16_t>(sizeof(PageHeader)); 
-    header_.key_count = 0;
-    header_.dir_count = 0;            
+    header_.key_count = 0;           
 
     serialize_to_buffer();
-    finalize_page_checksum(data_); 
 }
 
     // 将页头序列化到缓冲区
@@ -102,7 +140,7 @@ public:
 
         // 验证校验和
         if (stored_checksum != calculated_checksum) {
-            return false;  // 校验失败
+            return false;  
         }
 
         // 反序列化页头
@@ -127,7 +165,7 @@ public:
         serialize_to_buffer();
     }
 
-    // 是否为叶子节点（使用 PageHeader::page_type）
+    // 是否为叶子节点
     bool is_leaf() const { return header_.page_type == LEAF_PAGE; }
     void set_leaf(bool is_leaf) {
         header_.page_type = is_leaf ? LEAF_PAGE : INTERNAL_PAGE;
@@ -146,7 +184,7 @@ public:
     bool is_dirty() const { return dirty_; }
     void set_dirty(bool dirty) { dirty_ = dirty; }
 
-    // 钉住页（防止被换出内存）
+    // 钉住页
     void pin() { is_pinned_ = true; }
     void unpin() { is_pinned_ = false; }
     bool is_pinned() const { return is_pinned_; }
@@ -160,36 +198,62 @@ public:
         return reinterpret_cast<SlotEntry*>(data_ + slot_offset);
     }
 
-    // 插入数据项（通用方法）
-    bool insert_item(const void* item_data, uint16_t item_size, uint16_t& slot_idx) {
-        // 检查空间是否足够（需要槽目录空间 + 数据空间）
-        uint16_t required_space = sizeof(SlotEntry) + item_size;
-        if (get_free_space() < required_space) {
-            return false;  // 空间不足
-        }
+    bool insert_index_item(const void* item_data, uint16_t item_size, int key, uint16_t& slot_idx) {
+    // 1. 获取当前页中 Slot Array 的首地址指针
+    /*
+    [ PageHeader | SlotEntry | SlotEntry | SlotEntry | ... ]
+                 ↑
+                 slot_array_offset
+    */
+    uint8_t* slot_array_ptr = data_ + get_slot_array_offset(); 
 
-        // 分配槽位
-        slot_idx = header_.key_count;
-        
-        // 更新数据区指针（向下增长）
-        header_.upper_ptr -= item_size;
-        
-        // 写入数据
-        std::memcpy(data_ + header_.upper_ptr, item_data, item_size);
-        
-        // 更新槽目录
-        SlotEntry* slot = reinterpret_cast<SlotEntry*>(
-            data_ + header_.lower_ptr
+    // 2. 确定插入位置
+    uint16_t target_idx = find_insertion_point(key);
+
+    // 计算本次操作对连续空闲区的绝对消耗
+    // 消耗 = 新槽位 + 数据 + 预留给目录的增长
+    uint16_t total_consumption = sizeof(SlotEntry) + item_size + dir_growth;
+
+    // 严格检查：确保中间 Free 区足以容纳
+    if (header_.lower_ptr + total_consumption > header_.upper_ptr - current_dir_space) {
+        // 问题 4 的对策：如果空间不足，尝试 Purge（物理删除那些标为 dead 的索引槽）
+        // if (has_dead_slots()) { purge_index_page(); return insert_index_item(...); }
+        return false; 
+    }
+
+    // --- 物理落地阶段 ---
+
+    // 4. 目录空间预留落地（解决问题 1 的核心：先挪指针，后写数据）
+    if (needs_new_dir) {
+        // 注意：PageDir 位于数据区之上，所以我们要压低有效的 upper 界限
+        // 我们不立即写 Directory，但必须通过某种方式标记这块地被占了
+        reserve_directory_space(sizeof(uint16_t)); 
+    }
+
+    // 5. 槽位挪移（保持有序）
+    if (target_idx < header_.key_count) {
+        std::memmove(
+            slot_array_ptr + (target_idx + 1) * sizeof(SlotEntry),
+            slot_array_ptr + target_idx * sizeof(SlotEntry),
+            (header_.key_count - target_idx) * sizeof(SlotEntry)
         );
-        slot->offset = header_.upper_ptr;
-        slot->length = item_size;
-        
-        // 更新槽目录指针（向上增长）
-        header_.lower_ptr += sizeof(SlotEntry);
-        header_.key_count++;
-        
-        serialize_to_buffer();
-        return true;
+    }
+
+    // 6. 数据写入 (Scheme B)
+    header_.upper_ptr -= item_size;
+    std::memcpy(data_ + header_.upper_ptr, key_data, item_size);
+
+    // 7. 更新元数据 (解决问题 3：Key_count 仅在 Index 上下文代表记录数)
+    header_.key_count++; 
+    header_.lower_ptr += sizeof(SlotEntry);
+
+    SlotEntry se{header_.upper_ptr, item_size};
+    write_slot_to_buffer(target_idx, se);
+
+    slot_idx = target_idx;
+    this->dirty_ = true; 
+
+    return true;
     }
 
     // 插入叶子节点条目
@@ -234,55 +298,21 @@ public:
         return true;
     }
 
-    // 删除条目（通过标记槽为无效，实际空间整理需要额外操作）
+    // 逻辑删除条目（标记槽为无效）
     bool delete_item(uint16_t slot_idx) {
         if (slot_idx >= header_.key_count) {
             return false;
         }
-        
+
         SlotEntry* slot = get_slot(slot_idx);
         if (!slot) return false;
-        
+
         // 标记为删除（长度设为0）
         slot->length = 0;
-        
+
+        // 仅序列化页头以记录删除标记（物理回收由上层或后台维护触发）
         serialize_to_buffer();
         return true;
-    }
-
-    // 压缩页空间（整理碎片）
-    void compact() {
-        std::vector<std::pair<uint16_t, uint16_t>> valid_items;  // <offset, length>
-        
-        // 收集所有有效条目
-        for (uint16_t i = 0; i < header_.key_count; ++i) {
-            SlotEntry* slot = get_slot(i);
-            if (slot && slot->length > 0) {
-                valid_items.push_back({slot->offset, slot->length});
-            }
-        }
-        
-        // 重新布局数据区
-        uint16_t new_upper = PAGE_SIZE;
-        for (size_t i = 0; i < valid_items.size(); ++i) {
-            auto [old_offset, length] = valid_items[i];
-            new_upper -= length;
-            
-            // 移动数据
-            if (old_offset != new_upper) {
-                std::memmove(data_ + new_upper, data_ + old_offset, length);
-            }
-            
-            // 更新槽
-            SlotEntry* slot = get_slot(i);
-            slot->offset = new_upper;
-        }
-        
-        header_.upper_ptr = new_upper;
-        header_.key_count = valid_items.size();
-        header_.lower_ptr = sizeof(PageHeader) + header_.key_count * sizeof(SlotEntry);
-        
-        serialize_to_buffer();
     }
 
     // 搜索键（二分查找，要求键已排序）
@@ -295,13 +325,13 @@ public:
             
             int mid_key;
             if (is_leaf()) {
-                LeafEntry entry;
+                LeafNode entry;
                 if (!const_cast<Page*>(this)->get_leaf_entry(mid, entry)) {
                     break;
                 }
                 mid_key = entry.key;
             } else {
-                InternalEntry entry;
+                InternalNode entry;
                 if (!const_cast<Page*>(this)->get_internal_entry(mid, entry)) {
                     break;
                 }
@@ -325,14 +355,14 @@ public:
     int linear_search_key(int key) const {
         for (uint16_t i = 0; i < header_.key_count; ++i) {
             if (is_leaf()) {
-                LeafEntry entry;
+                LeafNode entry;
                 if (const_cast<Page*>(this)->get_leaf_entry(i, entry)) {
                     if (entry.key == key) {
                         return i;
                     }
                 }
             } else {
-                InternalEntry entry;
+                InternalNode entry;
                 if (const_cast<Page*>(this)->get_internal_entry(i, entry)) {
                     if (entry.key == key) {
                         return i;
